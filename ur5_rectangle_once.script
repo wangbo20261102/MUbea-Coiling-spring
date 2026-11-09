@@ -1,0 +1,108 @@
+# UR5 CB3 PolyScope >= 3.14.3; load as a PolyScope Script File node.
+# Base frame, metres and radians. Active TCP/payload must be configured.
+def mubea_rectangle_once():
+  local z_floor = 0.100
+  local z_run = 0.110
+  local x_min = -0.4482
+  local x_max = 0.1759
+  local y_min = -0.6644
+  local y_max = 0.2093
+  local speed = 0.020
+  local accel = 0.050
+  local sample_step = 0.005
+  local joint_step_limit = 0.35
+
+  def abort_cycle(message):
+    textmsg(message)
+    popup(message, title="MUbea cycle stopped", error=True, blocking=False)
+    halt
+  end
+
+  # Screen the entire route before moving, including return to origin.
+  # This is sampled IK checking, not continuous collision checking.
+  def check_segment(p_from, p_to, q_from):
+    local distance = norm([p_to[0]-p_from[0], p_to[1]-p_from[1], p_to[2]-p_from[2]])
+    local count = ceil(distance / sample_step) + 1
+    local k = 0
+    local q_prev = q_from
+    while k <= count:
+      local sample = interpolate_pose(p_from, p_to, k / count)
+      if sample[2] < z_floor:
+        abort_cycle("Planned TCP Z is below 100 mm.")
+      end
+      if not get_inverse_kin_has_solution(sample, qnear=q_prev):
+        abort_cycle("Path has no IK solution. Check TCP and start orientation.")
+      end
+      local q_next = get_inverse_kin(sample, qnear=q_prev)
+      if not is_within_safety_limits(q_next):
+        abort_cycle("Path exceeds configured robot safety limits.")
+      end
+      local j = 0
+      while j < 6:
+        if abs(q_next[j] - q_prev[j]) > joint_step_limit:
+          abort_cycle("Large joint change on path. Check posture/singularity.")
+        end
+        j = j + 1
+      end
+      q_prev = q_next
+      k = k + 1
+      sync()
+    end
+    return q_prev
+  end
+
+  # Capture exactly once: origin includes the starting TCP orientation.
+  local origin = get_actual_tcp_pose()
+  if origin[2] < z_floor:
+    abort_cycle("Start TCP Z is below 100 mm. Reposition before running.")
+  end
+  if z_run < z_floor:
+    abort_cycle("Run height must be at least 100 mm.")
+  end
+  local travel_z = z_run
+  if origin[2] > travel_z:
+    travel_z = origin[2]
+  end
+  local rx = origin[3]
+  local ry = origin[4]
+  local rz = origin[5]
+  local origin_up = p[origin[0], origin[1], travel_z, rx, ry, rz]
+  local corner1_up = p[x_max, y_min, travel_z, rx, ry, rz]
+  local corner1 = p[x_max, y_min, z_run, rx, ry, rz]
+  local corner2 = p[x_min, y_min, z_run, rx, ry, rz]
+  local corner3 = p[x_min, y_max, z_run, rx, ry, rz]
+  local corner4 = p[x_max, y_max, z_run, rx, ry, rz]
+  local corner4_up = p[x_max, y_max, travel_z, rx, ry, rz]
+  # 1 -> 2 -> 3 -> 4, then return; no additional 4 -> 1 pass.
+  local route = [origin_up, corner1_up, corner1, corner2, corner3, corner4, corner4_up, origin_up, origin]
+  local previous = origin
+  local q_seed = get_actual_joint_positions()
+  local i = 0
+  while i < length(route):
+    q_seed = check_segment(previous, route[i], q_seed)
+    previous = route[i]
+    i = i + 1
+  end
+
+  textmsg("MUbea: preflight passed; running one cycle.")
+  i = 0
+  while i < length(route):
+    local actual = get_actual_tcp_pose()
+    if actual[2] < z_floor:
+      abort_cycle("Measured TCP Z is below 100 mm.")
+    end
+    local target = route[i]
+    local remaining = norm([target[0]-actual[0], target[1]-actual[1], target[2]-actual[2]])
+    if remaining > 0.000001:
+      movel(target, a=accel, v=speed, r=0)
+    end
+    i = i + 1
+  end
+  local finished = get_actual_tcp_pose()
+  if finished[2] < z_floor:
+    abort_cycle("Final measured TCP Z is below 100 mm.")
+  end
+  textmsg("MUbea: one cycle complete; returned to start TCP pose.")
+end
+
+mubea_rectangle_once()
